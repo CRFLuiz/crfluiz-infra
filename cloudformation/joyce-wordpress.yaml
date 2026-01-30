@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Selecione a VPC
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Selecione a Subnet(s) da VPC escolhida
+  ResourcePrefix:
+    Type: String
+    Description: Prefixo para padronizar os nomes dos recursos
+    Default: joyce-wordpress
+  ExistingS3BucketName:
+    Type: String
+    Description: Nome do Bucket S3 existente a ser utilizado
+    Default: alchembook-workspace-bucket
+  KeyPair:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: O nome do Key Pair a ser usado nas instancias EC2
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: "A Zona de Disponibilidade onde o volume persistente e a instancia serao criados (ex: us-west-2a)"
+    Default: us-west-2d
+  ASGMinCapacity:
+    Type: Number
+    Default: 0
+  ASGMaxCapacity:
+    Type: Number
+    Default: 3
+  ASGDesireedCapacity:
+    Type: Number
+    Default: 0
+  DomainName:
+    Type: String
+    Description: Nome do dominio para o qual o DNS sera configurado
+    Default: joyce.lcdev.click
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref ExistingS3BucketName, ""]
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub ${ResourcePrefix}-s3
+
+  # Volume Persistente Independente
+  PersistentVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain # Garante que o volume nao seja deletado se a stack for deletada
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Size: 8
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-data-volume
+
+  # IAM Role para instancias
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ResourcePrefix}-InstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource: !If [CreateS3Bucket, !Sub "arn:aws:s3:::${ResourcePrefix}-s3/*", !Sub "arn:aws:s3:::${ExistingS3BucketName}/*"]
+        - PolicyName: !Sub ${ResourcePrefix}-InstancePolicy2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - route53:ListHostedZones
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - ec2:*
+                  - autoscaling:*
+                  - cloudwatch:*
+                  - logs:*
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref "AWS::Region"
+
+  # Launch Template
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ResourcePrefix}-LaunchTemplate
+      VersionDescription: v1
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              DeleteOnTermination: true
+        InstanceType: m6g.large
+        ImageId: ami-0d72bb9fb78590f97 # Ubuntu 22.04 ARM64
+        UserData: !Base64
+          Fn::Sub:
+            - |
+              #!/bin/bash
+
+              # UserData script is located in /var/lib/cloud/instance/scripts/part-001
+
+              # INITIAL CONFIGURATION
+              apt update -y
+              apt install -y s3fs zip unzip amazon-ec2-utils curl git
+
+              # INSTALL AWS CLI (ARM64)
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              ./aws/install
+              # AND CONFIGURE CLOUDWATCH AGENT
+              wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/arm64/latest/amazon-cloudwatch-agent.deb
+              dpkg -i -E ./amazon-cloudwatch-agent.deb
+
+              # Create CloudWatch Agent config file
+              cat <<'EOF' > /opt/aws/amazon-cloudwatch-agent/bin/config.json
+              {
+                "agent": {
+                  "metrics_collection_interval": 60,
+                  "run_as_user": "root"
+                },
+                "metrics": {
+                  "append_dimensions": {
+                    "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+                    "ImageId": "${!aws:ImageId}",
+                    "InstanceId": "${!aws:InstanceId}",
+                    "InstanceType": "${!aws:InstanceType}"
+                  },
+                  "metrics_collected": {
+                    "mem": {
+                      "measurement": [
+                        "mem_used_percent"
+                      ],
+                      "metrics_collection_interval": 60
+                    },
+                    "cpu": {
+                      "measurement": [
+                        "cpu_usage_idle",
+                        "cpu_usage_iowait",
+                        "cpu_usage_user",
+                        "cpu_usage_system"
+                      ],
+                      "metrics_collection_interval": 60,
+                      "totalcpu": true
+                    }
+                  }
+                }
+              }
+              EOF
+
+              # Start CloudWatch Agent
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json
+
+
+              # INSTALL all
+
+              # INSTALL GITHUB CLI (gh)
+              mkdir -p -m 755 /etc/apt/keyrings
+              wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+              chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+              apt update
+              apt install gh -y
+
+              # ATTACH PERSISTENT VOLUME
+              INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+              REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+              
+              # Loop to wait for attachment capability
+              aws ec2 attach-volume --volume-id ${PERSISTENT_VOLUME_ID} --instance-id $INSTANCE_ID --device /dev/sdf --region $REGION
+              
+              # Wait for device to appear
+              DEVICE_NAME=""
+              MAX_RETRIES=60
+              count=0
+              while [ $count -lt $MAX_RETRIES ]; do
+                  # Try to find device by volume ID (robust for Nitro instances)
+                  # Remove 'vol-' prefix if present for some checks, but typically EBS volume ID is needed directly
+                  # Using NVMe specific identification
+                  for dev in /dev/nvme[1-9]n1; do
+                      if [ -e "$dev" ]; then
+                          # Check if this device matches our volume ID
+                          # ebsnvme-id is the best tool for this on Amazon Linux/Ubuntu
+                          if command -v ebsnvme-id &> /dev/null; then
+                              vol_id=$(ebsnvme-id -v $dev)
+                              # Clean up volume ID string if it contains "Volume ID: " prefix
+                              vol_id=$(echo "$vol_id" | sed 's/Volume ID: //')
+                              if [ "$vol_id" == "${PERSISTENT_VOLUME_ID}" ]; then
+                                  DEVICE_NAME=$dev
+                                  break 2
+                              fi
+                          else
+                              # Fallback: simple check if it is not the root device (usually nvme0n1)
+                              # and assuming only one extra volume is attached
+                              if [ "$dev" != "/dev/nvme0n1" ]; then
+                                  DEVICE_NAME=$dev
+                                  break 2
+                              fi
+                          fi
+                      fi
+                  done
+                  sleep 1
+                  ((count++))
+              done
+
+              if [ -z "$DEVICE_NAME" ]; then
+                  echo "Volume ${PERSISTENT_VOLUME_ID} not found attached."
+                  # Don't exit, try to continue with other setup
+              fi
+
+              # FORMAT AND MOUNT SECOND EBS (5GB)
+              # Check if device exists and has no filesystem
+              if [ -n "$DEVICE_NAME" ] && [ -b "$DEVICE_NAME" ]; then
+                # Check if formatted (blkid returns exit code 0 if formatted)
+                if ! blkid "$DEVICE_NAME"; then
+                    mkfs -t xfs "$DEVICE_NAME"
+                fi
+                mkdir -p /app
+                # Use 'auto' to support existing filesystems (ext4) or new ones (xfs)
+                echo "$DEVICE_NAME /app auto defaults,nofail 0 2" >> /etc/fstab
+                mount -a
+                chown -R ubuntu:ubuntu /app
+              fi
+
+              # S3FS CONFIGURATION
+              mkdir -p /tmp/${PROJECT_NAME}
+              chown -R ubuntu:ubuntu /tmp/${PROJECT_NAME}
+              echo "${S3_BUCKET} /tmp/${PROJECT_NAME} fuse.s3fs _netdev,allow_other,iam_role=auto,url=https://s3.amazonaws.com 0 0" >> /etc/fstab
+              systemctl daemon-reexec
+              mount -a
+
+              # BASHRC CONFIGURATION
+              cp /tmp/${PROJECT_NAME}/bashrc-completion /tmp/bashrc-completion
+              echo "" >> /tmp/bashrc-completion
+              echo "export S3FS_DIR=/tmp/${PROJECT_NAME}" >> /tmp/bashrc-completion
+              echo "" >> /tmp/bashrc-completion
+              echo "PATH=\$PATH:/home/ubuntu/mylib" >> /tmp/bashrc-completion
+              cat /tmp/bashrc-completion >> /home/ubuntu/.bashrc
+              rm -rf /tmp/bashrc-completion
+
+              # DOCKER CONFIGURATION
+              # Override Docker installation to ensure ARM64 compatibility
+              # Remove old versions
+              apt-get remove -y docker docker-engine docker.io containerd runc
+              # Install dependencies
+              apt-get update
+              apt-get install -y ca-certificates curl gnupg
+              # Add Docker's official GPG key
+              install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              chmod a+r /etc/apt/keyrings/docker.gpg
+              # Set up the repository
+              echo \
+                "deb [arch=\"$(dpkg --print-architecture)\" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
+                tee /etc/apt/sources.list.d/docker.list > /dev/null
+              # Install Docker Engine and Docker Compose (Plugin)
+              apt-get update
+              apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              
+              # Add ubuntu user to docker group
+              usermod -aG docker ubuntu
+
+              # NODEJS CONFIGURATION
+              # Install NVM and Node.js correctly for user ubuntu
+              runuser -l ubuntu -c 'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash'
+              # Ensure NVM is loaded and Node is installed
+              runuser -l ubuntu -c 'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"; nvm install 20; nvm use 20; npm install -g yarn'
+
+              # ADD SSH KEY
+              cp /tmp/${PROJECT_NAME}/id_ed25519 /home/ubuntu/.ssh/id_ed25519
+              chmod 400 /home/ubuntu/.ssh/id_ed25519
+              chown ubuntu:ubuntu /home/ubuntu/.ssh/id_ed25519
+
+              # COMMANDS LIBRARY CONFIGURATION
+              mkdir -p /home/ubuntu/mylib
+              cp /tmp/${PROJECT_NAME}/gcp /home/ubuntu/mylib/gcp
+              cp /tmp/${PROJECT_NAME}/env_* /home/ubuntu/mylib/.
+              cp /tmp/${PROJECT_NAME}/my_commands /home/ubuntu/mylib/.
+              cp /tmp/${PROJECT_NAME}/alchem_clone /home/ubuntu/mylib/.
+              cp /tmp/${PROJECT_NAME}/ssh-config /home/ubuntu/mylib/.
+              cp /tmp/${PROJECT_NAME}/docker_config /home/ubuntu/mylib/.
+              cp /tmp/${PROJECT_NAME}/docker_config /home/ubuntu/mylib/.
+              cp /tmp/${PROJECT_NAME}/node_config /home/ubuntu/mylib/.
+              chmod -R +x /home/ubuntu/mylib/.
+              chown -R ubuntu:ubuntu /home/ubuntu/mylib/.
+
+              # UPDATE DNS RECORD (INLINE)
+              PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+              # Hosted Zone ID for lcdev.click (hardcoded for reliability as per task context)
+              HOSTED_ZONE_ID="Z054448725Z37L2S6JXEH"
+              
+              aws route53 change-resource-record-sets --hosted-zone-id $HOSTED_ZONE_ID --change-batch "{
+                \"Comment\": \"Update record to new EC2 IP\",
+                \"Changes\": [
+                  {
+                    \"Action\": \"UPSERT\",
+                    \"ResourceRecordSet\": {
+                      \"Name\": \"${DOMAIN_NAME}\",
+                      \"Type\": \"A\",
+                      \"TTL\": 60,
+                      \"ResourceRecords\": [
+                        {
+                          \"Value\": \"$PUBLIC_IP\"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }"
+
+              # CONFIGURE DNS TO THE INSTANCE (Original Script - kept for compatibility if needed, but the inline one above handles the main record)
+              if [ -f /tmp/${PROJECT_NAME}/dns-config.sh ]; then
+                cp /tmp/${PROJECT_NAME}/dns-config.sh /tmp/dns-config.sh
+                chmod +x /tmp/dns-config.sh
+                /tmp/dns-config.sh ${DOMAIN_NAME}
+              fi
+            - S3_BUCKET: !If [CreateS3Bucket, !Ref S3Bucket, !Ref ExistingS3BucketName]
+              PROJECT_NAME: !Ref ResourcePrefix
+              DOMAIN_NAME: !Ref DomainName
+              PERSISTENT_VOLUME_ID: !Ref PersistentVolume
+        KeyName: !Ref KeyPair
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+
+  # AutoScaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetIds # Passa todas as subnets selecionadas
+      MinSize: !Ref ASGMinCapacity
+      MaxSize: !Ref ASGMaxCapacity
+      DesiredCapacity: !Ref ASGDesireedCapacity
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: capacity-optimized
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref LaunchTemplate
+            Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+Outputs:
+  S3BucketUsed:
+    Description: Nome do S3 utilizado
+    Value: !If [CreateS3Bucket, !Ref S3Bucket, !Ref ExistingS3BucketName]
