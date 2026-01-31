@@ -26,7 +26,7 @@ Parameters:
     Default: 0
   ASGMaxCapacity:
     Type: Number
-    Default: 3
+    Default: 1
   ASGDesireedCapacity:
     Type: Number
     Default: 0
@@ -371,6 +371,10 @@ Resources:
           LaunchTemplateSpecification:
             LaunchTemplateId: !Ref LaunchTemplate
             Version: !GetAtt LaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: m7g.large
+            - InstanceType: c7g.large
+            - InstanceType: r7g.large
 
 Outputs:
   S3BucketUsed:
